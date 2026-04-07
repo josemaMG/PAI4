@@ -447,10 +447,62 @@ jobs:
             echo "No reports were collected."
           fi
 
+      - name: DefectDojo preflight context
+        run: |
+          echo "GitHub event: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
+          if [ -n "${DEFECTDOJO_URL:-}" ]; then
+            echo "DEFECTDOJO_URL configured: yes"
+          else
+            echo "DEFECTDOJO_URL configured: no"
+          fi
+
+          if [ -n "${DEFECTDOJO_API_TOKEN:-}" ]; then
+            echo "DEFECTDOJO_API_TOKEN configured: yes"
+          else
+            echo "DEFECTDOJO_API_TOKEN configured: no"
+          fi
+
+          if [ -n "${DEFECTDOJO_ENGAGEMENT_ID:-}" ]; then
+            echo "DEFECTDOJO_ENGAGEMENT_ID configured: yes"
+          else
+            echo "DEFECTDOJO_ENGAGEMENT_ID configured: no"
+          fi
+
+      - name: Validate DefectDojo API access
+        if: env.DEFECTDOJO_URL != '' && env.DEFECTDOJO_API_TOKEN != '' && env.DEFECTDOJO_ENGAGEMENT_ID != ''
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$DEFECTDOJO_ENGAGEMENT_ID" =~ ^[0-9]+$ ]]; then
+            echo "DEFECTDOJO_ENGAGEMENT_ID must be numeric. Current value is not a valid integer."
+            exit 1
+          fi
+
+          url="${DEFECTDOJO_URL%/}/api/v2/engagements/${DEFECTDOJO_ENGAGEMENT_ID}/"
+          echo "Checking DefectDojo engagement endpoint: $url"
+
+          http_code=$(curl --silent --show-error \
+            -o /tmp/dd-engagement-response.json \
+            -w "%{http_code}" \
+            -H "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
+            "$url")
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "DefectDojo API preflight failed with HTTP $http_code"
+            cat /tmp/dd-engagement-response.json || true
+            exit 1
+          fi
+
+          echo "DefectDojo API preflight OK (HTTP $http_code)"
+
       - name: Import findings into DefectDojo
         if: env.DEFECTDOJO_URL != '' && env.DEFECTDOJO_API_TOKEN != '' && env.DEFECTDOJO_ENGAGEMENT_ID != ''
-        continue-on-error: true
         run: |
+          set -euo pipefail
+
+          uploaded_count=0
+
           upload_scan() {
             local report_path="$1"
             local scan_type="$2"
@@ -461,7 +513,9 @@ jobs:
             fi
 
             echo "Uploading $report_path as '$scan_type'"
-            curl --silent --show-error --fail \
+            http_code=$(curl --silent --show-error \
+              -o /tmp/dd-upload-response.json \
+              -w "%{http_code}" \
               -X POST "${DEFECTDOJO_URL%/}/api/v2/import-scan/" \
               -H "Authorization: Token ${DEFECTDOJO_API_TOKEN}" \
               -F "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
@@ -471,13 +525,29 @@ jobs:
               -F "verified=false" \
               -F "close_old_findings=false" \
               -F "scan_date=$(date +%F)" \
-              -F "file=@${report_path}" > /dev/null
+              -F "file=@${report_path}")
+
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "Failed uploading $report_path (scan_type='$scan_type'). HTTP $http_code"
+              cat /tmp/dd-upload-response.json || true
+              return 1
+            fi
+
+            echo "Upload successful for $report_path (HTTP $http_code)"
+            uploaded_count=$((uploaded_count + 1))
           }
 
           upload_scan "aggregated-reports/semgrep-security-report/semgrep.json" "Semgrep JSON Report"
           upload_scan "aggregated-reports/trivy-security-report/trivy-fs.json" "Trivy Scan"
           upload_scan "aggregated-reports/trivy-security-report/trivy-config.json" "Trivy Scan"
           upload_scan "aggregated-reports/zap-security-report/zap-report.xml" "ZAP Scan"
+
+          if [ "$uploaded_count" -eq 0 ]; then
+            echo "No reports were uploaded to DefectDojo."
+            exit 1
+          fi
+
+          echo "Total reports uploaded to DefectDojo: $uploaded_count"
 
       - name: DefectDojo not configured
         if: env.DEFECTDOJO_URL == '' || env.DEFECTDOJO_API_TOKEN == '' || env.DEFECTDOJO_ENGAGEMENT_ID == ''
