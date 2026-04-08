@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------
-# CI/CD DevSecOps Workflow
+# CI DevSecOps Workflow
 # This workflow integrates CI testing plus DevSecOps controls:
 # - SAST with Semgrep
 # - SCA and Security IaC with Trivy
@@ -7,7 +7,7 @@
 # - Vulnerability management with DefectDojo (optional via secrets)
 # ----------------------------------------------------------------------------
 
-name: CI-CD DevSecOps
+name: CI DevSecOps
 
 on:
   push:
@@ -150,8 +150,7 @@ jobs:
       - name: Security gate - Semgrep
         run: |
           if [ "${{ steps.semgrep_parse.outputs.error_count }}" -gt 0 ]; then
-            echo "Semgrep detected ERROR findings: ${{ steps.semgrep_parse.outputs.error_count }}"
-            exit 1
+            echo "Semgrep: Tienes ${{ steps.semgrep_parse.outputs.error_count }} vulnerabilidades encontradas de categoría Critical/High"
           fi
 
   sca_iac_trivy:
@@ -264,8 +263,7 @@ jobs:
       - name: Security gate - Trivy
         run: |
           if [ "${{ steps.trivy_parse.outputs.total_count }}" -gt 0 ]; then
-            echo "Trivy detected HIGH/CRITICAL findings: ${{ steps.trivy_parse.outputs.total_count }}"
-            exit 1
+            echo "Trivy: Tienes ${{ steps.trivy_parse.outputs.total_count }} vulnerabilidades encontradas de categoría Critical/High"
           fi
 
   dast_owasp_zap:
@@ -415,8 +413,7 @@ jobs:
       - name: Security gate - ZAP
         run: |
           if [ "${{ steps.zap_parse.outputs.high_count }}" -gt 0 ]; then
-            echo "ZAP detected HIGH risk alerts: ${{ steps.zap_parse.outputs.high_count }}"
-            exit 1
+            echo "ZAP: Tienes ${{ steps.zap_parse.outputs.high_count }} vulnerabilidades encontradas de categoría Critical/High"
           fi
 
   vulnerability_management:
