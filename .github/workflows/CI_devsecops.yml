@@ -20,6 +20,7 @@ permissions:
   contents: read
   actions: read
   security-events: write
+  issues: write
 
 env:
   PYTHON_VERSION: '3.12'
@@ -443,6 +444,432 @@ jobs:
           else
             echo "No reports were collected."
           fi
+
+      - name: Build GitHub issue candidates
+        id: build_issue_candidates
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          artifacts_root = Path("aggregated-reports")
+          output_dir = Path("reports/github-issues")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          output_file = output_dir / "findings.json"
+
+          findings = []
+
+          def normalize_severity(raw):
+              value = str(raw or "").strip().lower()
+              if value in {"critical", "high", "medium", "low"}:
+                  return value
+              if value == "error":
+                  return "high"
+              if value in {"warning", "warn"}:
+                  return "medium"
+              if value in {"info", "informational"}:
+                  return "low"
+              return "unknown"
+
+          def add_finding(
+              source,
+              category,
+              severity,
+              title,
+              location,
+              description,
+              recommendation,
+              identifier,
+              fingerprint_parts,
+          ):
+              sev = normalize_severity(severity)
+              if sev == "unknown":
+                  return
+
+              fingerprint_base = "||".join(
+                  [source, category, identifier or "", location or "", title or ""]
+                  + [str(p) for p in fingerprint_parts if p]
+              )
+              fingerprint = hashlib.sha256(fingerprint_base.encode("utf-8")).hexdigest()[:20]
+
+              findings.append(
+                  {
+                      "source": source,
+                      "category": category,
+                      "severity": sev,
+                      "title": (title or "Unnamed vulnerability").strip(),
+                      "location": (location or "N/A").strip(),
+                      "description": (description or "").strip(),
+                      "recommendation": (recommendation or "").strip(),
+                      "identifier": (identifier or "").strip(),
+                      "fingerprint": fingerprint,
+                  }
+              )
+
+          semgrep_report = artifacts_root / "semgrep-security-report" / "semgrep.json"
+          if semgrep_report.exists():
+              data = json.loads(semgrep_report.read_text(encoding="utf-8"))
+              for result in data.get("results", []):
+                  raw_sev = str(result.get("extra", {}).get("severity", "")).upper()
+                  if raw_sev not in {"ERROR", "WARNING"}:
+                      continue
+
+                  path = result.get("path", "N/A")
+                  start_line = result.get("start", {}).get("line")
+                  location = f"{path}:{start_line}" if start_line else path
+
+                  add_finding(
+                      source="semgrep",
+                      category="sast",
+                      severity=raw_sev,
+                      title=result.get("check_id")
+                      or result.get("extra", {}).get("message")
+                      or "Semgrep finding",
+                      location=location,
+                      description=result.get("extra", {}).get("message", ""),
+                      recommendation=result.get("extra", {})
+                      .get("metadata", {})
+                      .get("remediation", ""),
+                      identifier=result.get("check_id", ""),
+                      fingerprint_parts=[
+                          path,
+                          start_line,
+                          result.get("extra", {}).get("message", ""),
+                      ],
+                  )
+
+          def parse_trivy(path):
+              if not path.exists():
+                  return
+
+              data = json.loads(path.read_text(encoding="utf-8"))
+              for result in data.get("Results", []):
+                  target = result.get("Target", "N/A")
+
+                  for vuln in result.get("Vulnerabilities") or []:
+                      add_finding(
+                          source="trivy",
+                          category="sca",
+                          severity=vuln.get("Severity", ""),
+                          title=vuln.get("Title")
+                          or vuln.get("PkgName")
+                          or vuln.get("VulnerabilityID")
+                          or "Trivy vulnerability",
+                          location=target,
+                          description=vuln.get("Description", ""),
+                          recommendation=f"Fixed version: {vuln.get('FixedVersion') or 'N/A'}",
+                          identifier=vuln.get("VulnerabilityID", ""),
+                          fingerprint_parts=[
+                              target,
+                              vuln.get("PkgName"),
+                              vuln.get("InstalledVersion"),
+                              vuln.get("VulnerabilityID"),
+                          ],
+                      )
+
+                  for misconfig in result.get("Misconfigurations") or []:
+                      resource_name = (
+                          misconfig.get("CauseMetadata", {})
+                          .get("Resource", {})
+                          .get("Name")
+                      )
+                      add_finding(
+                          source="trivy",
+                          category="iac",
+                          severity=misconfig.get("Severity", ""),
+                          title=misconfig.get("Title")
+                          or misconfig.get("ID")
+                          or "Trivy misconfiguration",
+                          location=resource_name or target,
+                          description=misconfig.get("Description", ""),
+                          recommendation=misconfig.get("Resolution", ""),
+                          identifier=misconfig.get("ID", ""),
+                          fingerprint_parts=[
+                              target,
+                              misconfig.get("ID"),
+                              misconfig.get("Title"),
+                              resource_name,
+                          ],
+                      )
+
+                  for secret in result.get("Secrets") or []:
+                      start_line = secret.get("StartLine")
+                      location = f"{target}:{start_line}" if start_line else target
+                      add_finding(
+                          source="trivy",
+                          category="secret",
+                          severity=secret.get("Severity", "") or "HIGH",
+                          title=secret.get("Title") or secret.get("RuleID") or "Trivy secret",
+                          location=location,
+                          description=secret.get("Match", ""),
+                          recommendation="Rotate the exposed secret and remove it from code and history.",
+                          identifier=secret.get("RuleID", ""),
+                          fingerprint_parts=[
+                              target,
+                              secret.get("RuleID"),
+                              start_line,
+                              secret.get("Match"),
+                          ],
+                      )
+
+          parse_trivy(artifacts_root / "trivy-security-report" / "trivy-fs.json")
+          parse_trivy(artifacts_root / "trivy-security-report" / "trivy-config.json")
+
+          zap_report = artifacts_root / "zap-security-report" / "zap-report.json"
+          if zap_report.exists():
+              data = json.loads(zap_report.read_text(encoding="utf-8"))
+              sites = data.get("site", [])
+              if isinstance(sites, dict):
+                  sites = [sites]
+
+              risk_map = {"3": "critical", "2": "high", "1": "medium"}
+
+              for site in sites:
+                  site_name = site.get("@name") or site.get("name") or "N/A"
+                  for alert in site.get("alerts", []):
+                      risk_code = str(alert.get("riskcode", "")).strip()
+                      if risk_code not in risk_map:
+                          continue
+
+                      instances = alert.get("instances") or [{}]
+                      if isinstance(instances, dict):
+                          instances = [instances]
+
+                      for instance in instances:
+                          uri = instance.get("uri") or site_name
+                          param = instance.get("param")
+                          location = uri if not param else f"{uri} (param: {param})"
+                          cwe_id = str(alert.get("cweid", "")).strip()
+                          identifier = f"CWE-{cwe_id}" if cwe_id.isdigit() and int(cwe_id) > 0 else ""
+
+                          add_finding(
+                              source="zap",
+                              category="dast",
+                              severity=risk_map[risk_code],
+                              title=alert.get("name") or "ZAP alert",
+                              location=location,
+                              description=alert.get("desc", ""),
+                              recommendation=alert.get("solution", ""),
+                              identifier=identifier,
+                              fingerprint_parts=[
+                                  alert.get("pluginid"),
+                                  alert.get("name"),
+                                  uri,
+                                  param,
+                                  instance.get("method"),
+                                  instance.get("attack"),
+                              ],
+                          )
+
+          unique_findings = {}
+          for finding in findings:
+              unique_findings[finding["fingerprint"]] = finding
+
+          findings = list(unique_findings.values())
+
+          severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+          findings.sort(
+              key=lambda f: (
+                  severity_rank.get(f["severity"], 0),
+                  f["source"],
+                  f["title"],
+                  f["location"],
+              ),
+              reverse=True,
+          )
+
+          output_file.write_text(
+              json.dumps(findings, ensure_ascii=True, indent=2), encoding="utf-8"
+          )
+
+          print(f"Issue candidates generated: {len(findings)}")
+          print(f"Candidates file: {output_file}")
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as out:
+                  out.write(f"total_count={len(findings)}\n")
+                  out.write(f"candidates_file={output_file}\n")
+          PY
+
+      - name: Upload issue candidates artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-issue-candidates
+          path: reports/github-issues/findings.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Create GitHub issues for vulnerabilities
+        id: create_security_issues
+        if: github.event_name != 'pull_request' && steps.build_issue_candidates.outputs.total_count != '0'
+        uses: actions/github-script@v7
+        env:
+          FINDINGS_FILE: ${{ steps.build_issue_candidates.outputs.candidates_file }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const findingsPath = process.env.FINDINGS_FILE;
+            if (!findingsPath || !fs.existsSync(findingsPath)) {
+              core.setFailed(`Findings file not found: ${findingsPath || 'undefined'}`);
+              return;
+            }
+
+            const findings = JSON.parse(fs.readFileSync(findingsPath, 'utf8'));
+            if (!Array.isArray(findings) || findings.length === 0) {
+              core.info('No findings to process.');
+              core.setOutput('created_count', '0');
+              core.setOutput('skipped_count', '0');
+              return;
+            }
+
+            const trim = (value, maxLength) => {
+              const normalized = String(value || '');
+              if (normalized.length <= maxLength) {
+                return normalized;
+              }
+              return `${normalized.slice(0, maxLength - 3)}...`;
+            };
+
+            const existingOpenIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const openIssueBodies = existingOpenIssues.map((issue) => String(issue.body || ''));
+
+            const ensuredLabels = new Set();
+
+            const ensureLabel = async (name, color, description) => {
+              if (ensuredLabels.has(name)) {
+                return;
+              }
+
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color,
+                  description,
+                });
+              }
+
+              ensuredLabels.add(name);
+            };
+
+            await ensureLabel(
+              'devsecops-vulnerability',
+              'B60205',
+              'Automatically reported by CI DevSecOps workflow'
+            );
+            await ensureLabel('security', 'D93F0B', 'Security related issue');
+
+            const scannerColors = {
+              semgrep: '1D76DB',
+              trivy: '0E8A16',
+              zap: '5319E7',
+            };
+
+            const severityColors = {
+              critical: 'B60205',
+              high: 'D93F0B',
+              medium: 'FBCA04',
+              low: '0E8A16',
+            };
+
+            let created = 0;
+            let skipped = 0;
+
+            for (const finding of findings) {
+              const marker = `<!-- devsecops-fingerprint:${finding.fingerprint} -->`;
+              if (openIssueBodies.some((body) => body.includes(marker))) {
+                skipped += 1;
+                continue;
+              }
+
+              const source = String(finding.source || 'scanner').toLowerCase();
+              const severity = String(finding.severity || 'unknown').toLowerCase();
+              const sourceLabel = `scanner-${source}`;
+              const severityLabel = `severity-${severity}`;
+
+              await ensureLabel(
+                sourceLabel,
+                scannerColors[source] || '6A737D',
+                `Findings from ${source.toUpperCase()}`
+              );
+              await ensureLabel(
+                severityLabel,
+                severityColors[severity] || '6A737D',
+                `Severity level ${severity.toUpperCase()}`
+              );
+
+              const issueTitle = trim(
+                `[DevSecOps][${source.toUpperCase()}][${severity.toUpperCase()}] ${finding.title || 'Vulnerability detected'}`,
+                250
+              );
+
+              const issueBody = [
+                'This issue was created automatically by the CI DevSecOps workflow.',
+                '',
+                `- Source: ${finding.source || 'N/A'}`,
+                `- Category: ${finding.category || 'N/A'}`,
+                `- Severity: ${finding.severity || 'N/A'}`,
+                `- Identifier: ${trim(finding.identifier || 'N/A', 200)}`,
+                `- Location: ${trim(finding.location || 'N/A', 700)}`,
+                `- Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                'Description:',
+                trim(finding.description || 'N/A', 6000),
+                '',
+                'Recommendation:',
+                trim(finding.recommendation || 'N/A', 3000),
+                '',
+                marker,
+              ].join('\n');
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: [
+                  'devsecops-vulnerability',
+                  'security',
+                  sourceLabel,
+                  severityLabel,
+                ],
+              });
+
+              openIssueBodies.push(issueBody);
+              created += 1;
+            }
+
+            core.setOutput('created_count', String(created));
+            core.setOutput('skipped_count', String(skipped));
+            core.info(`Issues created: ${created}`);
+            core.info(`Potential duplicates skipped: ${skipped}`);
+
+      - name: Skip issue creation on pull requests
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Issue creation is skipped for pull_request events to avoid duplicates from non-merged changes."
 
       - name: DefectDojo preflight context
         run: |
