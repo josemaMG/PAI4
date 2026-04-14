@@ -727,6 +727,41 @@ jobs:
               return;
             }
 
+            const severityPriority = { critical: 2, high: 1 };
+
+            const eligibleFindings = findings
+              .filter((finding) => {
+                const severity = String(finding?.severity || '').toLowerCase();
+                return severity === 'critical' || severity === 'high';
+              })
+              .sort((a, b) => {
+                const aSeverity = String(a?.severity || '').toLowerCase();
+                const bSeverity = String(b?.severity || '').toLowerCase();
+                const severityDiff = (severityPriority[bSeverity] || 0) - (severityPriority[aSeverity] || 0);
+                if (severityDiff !== 0) {
+                  return severityDiff;
+                }
+
+                const sourceDiff = String(a?.source || '').localeCompare(String(b?.source || ''));
+                if (sourceDiff !== 0) {
+                  return sourceDiff;
+                }
+
+                const titleDiff = String(a?.title || '').localeCompare(String(b?.title || ''));
+                if (titleDiff !== 0) {
+                  return titleDiff;
+                }
+
+                return String(a?.location || '').localeCompare(String(b?.location || ''));
+              });
+
+            if (eligibleFindings.length === 0) {
+              core.info('No critical/high findings to create issues for.');
+              core.setOutput('created_count', '0');
+              core.setOutput('skipped_count', '0');
+              return;
+            }
+
             const trim = (value, maxLength) => {
               const normalized = String(value || '');
               if (normalized.length <= maxLength) {
@@ -796,8 +831,13 @@ jobs:
 
             let created = 0;
             let skipped = 0;
+            const maxIssues = 3;
 
-            for (const finding of findings) {
+            for (const finding of eligibleFindings) {
+              if (created >= maxIssues) {
+                break;
+              }
+
               const marker = `<!-- devsecops-fingerprint:${finding.fingerprint} -->`;
               if (openIssueBodies.some((body) => body.includes(marker))) {
                 skipped += 1;
@@ -865,6 +905,8 @@ jobs:
             core.setOutput('skipped_count', String(skipped));
             core.info(`Issues created: ${created}`);
             core.info(`Potential duplicates skipped: ${skipped}`);
+            core.info(`Eligible findings (critical/high): ${eligibleFindings.length}`);
+            core.info(`Max issues configured for this run: ${maxIssues}`);
 
       - name: Skip issue creation on pull requests
         if: github.event_name == 'pull_request'
